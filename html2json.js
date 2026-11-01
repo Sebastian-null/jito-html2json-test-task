@@ -1,8 +1,15 @@
 function convertHtml2JsonAndSet() {
   const htmlTextAreaValue = document.getElementById("html").value;
-  const jsonObj = html2json(htmlTextAreaValue);
   const jsonArea = document.getElementById("json");
-  jsonArea.textContent = JSON.stringify(jsonObj, null, 2);
+  // html2json is designed not to throw, but the page should still show
+  // something if it does (a bug, or JSON.stringify running out of memory).
+  try {
+    const jsonObj = html2json(htmlTextAreaValue);
+    jsonArea.textContent = JSON.stringify(jsonObj, null, 2);
+  } catch (error) {
+    console.error(error);
+    jsonArea.textContent = `Conversion failed: ${error}`;
+  }
 }
 
 /*

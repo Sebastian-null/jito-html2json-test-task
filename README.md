@@ -111,6 +111,7 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - The tree is built iteratively with an explicit stack, without recursion, so deeply nested input cannot overflow the call stack.
 - **Nesting is limited to 512 levels**, like in Chrome's parser: deeper elements are added as siblings, with one warning. `JSON.stringify` is recursive and throws `RangeError` on trees deeper than about 2800 levels (Node 26), so without the limit the result of valid HTML could not be serialized. The limit also keeps searching the stack for an end tag cheap.
 - The input is scanned in a single pass, with no regular expressions that could backtrack catastrophically.
+- If `html2json` or `JSON.stringify` still throws unexpectedly, `index.html` shows `Conversion failed: <error>` in the output field instead of failing silently (the full error goes to the browser console).
 
 ## Known limitations
 - Whitespace that contains a line break between inline elements (`<span>a</span>\n<span>b</span>`) is dropped, so the text reads `ab` while a browser shows `a b`. Telling inline from block elements depends on CSS, which cannot be known from HTML alone.
@@ -118,6 +119,7 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - Implicit closing only looks at the current node, so `<p><b>text<div>` puts the `<div>` inside `<b>`, while a browser closes both `<b>` and `<p>`.
 - Only the most common implicit-closing rules are implemented, not the full HTML5 tree construction algorithm (no "adoption agency" for misnested formatting tags, no table foster parenting).
 - Only a subset of named character references is supported. An unknown `&name;` is kept as written, while a browser may decode a legacy prefix of it (`&notit;` → `¬it;`).
+- Very deep input produces very large pretty-printed JSON, because every level adds indentation: `html_samples/22-deep-nesting.html` (10000 nested `<div>`s, limited to 512 levels) gives about 116 MB with `JSON.stringify(result, null, 2)`, but only about 600 KB without indentation. It still renders in Firefox in under a second.
 - `<script>`, `<style>` and `<title>` inside `<svg>` are also read as raw text. In a browser they are regular SVG elements there. The tokenizer does not know the tree context.
 
 ## Running tests
