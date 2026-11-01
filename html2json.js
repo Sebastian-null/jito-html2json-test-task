@@ -16,6 +16,184 @@ function html2json(htmlText) {
   };
 }
 
+/* ---------- Tokenizer ---------- */
+
+// No tags inside: everything up to the matching end tag is text.
+const RAW_TEXT_TAGS = new Set(["script", "style", "textarea", "title"]);
+
+function isAsciiWhitespace(ch) {
+  return ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f";
+}
+
+function isAsciiLetter(ch) {
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z");
+}
+
+function skipWhitespace(input, pos) {
+  while (pos < input.length && isAsciiWhitespace(input[pos])) pos++;
+  return pos;
+}
+
+// "<" starts a tag only before a letter ("<div") or "/" + letter ("</div").
+// Anything else ("a < b", "<3") is plain text.
+function isTagStart(input, pos) {
+  const next = input[pos + 1];
+  if (isAsciiLetter(next)) return true;
+  return next === "/" && isAsciiLetter(input[pos + 2]);
+}
+
+/*
+  Splits the input into a flat list of tokens in a single forward pass:
+    { type: "startTag", name, attributes, selfClosing, terminated, start, end }
+    { type: "endTag",   name, attributes, selfClosing, terminated, start, end }
+    { type: "text",     content, start, end }
+  `start` and `end` are offsets in the input, used later for warnings.
+*/
+function tokenize(input) {
+  const tokens = [];
+  let pos = 0;
+  let textStart = 0;
+
+  function pushText(end) {
+    if (end > textStart) {
+      tokens.push({ type: "text", content: input.slice(textStart, end), start: textStart, end });
+    }
+  }
+
+  while (pos < input.length) {
+    const lt = input.indexOf("<", pos);
+    if (lt === -1) break;
+    if (!isTagStart(input, lt)) {
+      pos = lt + 1;
+      continue;
+    }
+
+    pushText(lt);
+    const tag = readTag(input, lt);
+    tokens.push(tag);
+    pos = tag.end;
+
+    const name = tag.name.toLowerCase();
+    if (tag.type === "startTag" && !tag.selfClosing && RAW_TEXT_TAGS.has(name)) {
+      textStart = pos;
+      pos = findRawTextEnd(input, pos, name);
+      pushText(pos);
+    }
+    textStart = pos;
+  }
+
+  pushText(input.length);
+  return tokens;
+}
+
+// Reads "<name ...>" or "</name ...>" starting at the "<".
+// If the input ends inside the tag, the tag is kept with terminated: false.
+function readTag(input, start) {
+  const isEndTag = input[start + 1] === "/";
+  let pos = start + (isEndTag ? 2 : 1);
+
+  const nameStart = pos;
+  while (pos < input.length && !isTagNameEnd(input[pos])) pos++;
+  const name = input.slice(nameStart, pos);
+
+  const attributes = [];
+  let selfClosing = false;
+  let terminated = false;
+
+  while (pos < input.length) {
+    const ch = input[pos];
+    if (isAsciiWhitespace(ch)) {
+      pos++;
+    } else if (ch === ">") {
+      pos++;
+      terminated = true;
+      break;
+    } else if (ch === "/") {
+      pos++;
+      if (input[pos] === ">") {
+        pos++;
+        selfClosing = true;
+        terminated = true;
+        break;
+      }
+      // A "/" not followed by ">" is ignored, as in browsers.
+    } else {
+      pos = readAttribute(input, pos, attributes);
+    }
+  }
+
+  return {
+    type: isEndTag ? "endTag" : "startTag",
+    name,
+    attributes,
+    selfClosing,
+    terminated,
+    start,
+    end: pos,
+  };
+}
+
+function isTagNameEnd(ch) {
+  return isAsciiWhitespace(ch) || ch === "/" || ch === ">";
+}
+
+// Reads one attribute (name, optional "=" and value), adds it to `attributes`
+// and returns the position right after it.
+function readAttribute(input, pos, attributes) {
+  const nameStart = pos;
+  // The first character always belongs to the name, even "=" (<div =a>).
+  pos++;
+  while (pos < input.length && !isAttributeNameEnd(input[pos])) pos++;
+  const name = input.slice(nameStart, pos);
+
+  pos = skipWhitespace(input, pos);
+  if (input[pos] !== "=") {
+    attributes.push({ name, value: "" });
+    return pos;
+  }
+
+  pos = skipWhitespace(input, pos + 1);
+  const quote = input[pos];
+  let value;
+
+  if (quote === '"' || quote === "'") {
+    const close = input.indexOf(quote, pos + 1);
+    const valueEnd = close === -1 ? input.length : close;
+    value = input.slice(pos + 1, valueEnd);
+    pos = close === -1 ? valueEnd : close + 1;
+  } else {
+    // Unquoted: ends at whitespace or ">". A "/" is part of the value (href=/a/).
+    const valueStart = pos;
+    while (pos < input.length && !isAsciiWhitespace(input[pos]) && input[pos] !== ">") pos++;
+    value = input.slice(valueStart, pos);
+  }
+
+  attributes.push({ name, value });
+  return pos;
+}
+
+function isAttributeNameEnd(ch) {
+  return isAsciiWhitespace(ch) || ch === "/" || ch === ">" || ch === "=";
+}
+
+/*
+  Finds where raw text of `tagName` ends: the first "</tagName" (case-insensitive)
+  followed by whitespace, "/", ">" or the end of input. Like browsers, it does not
+  look inside JS strings, so "</script>" in a script string also ends the script.
+  Returns the input length if there is no end tag.
+*/
+function findRawTextEnd(input, pos, tagName) {
+  let candidate = input.indexOf("</", pos);
+  while (candidate !== -1) {
+    const nameEnd = candidate + 2 + tagName.length;
+    const after = input[nameEnd];
+    const nameMatches = input.slice(candidate + 2, nameEnd).toLowerCase() === tagName;
+    if (nameMatches && (after === undefined || isTagNameEnd(after))) return candidate;
+    candidate = input.indexOf("</", candidate + 2);
+  }
+  return input.length;
+}
+
 function showExample1() {
   const htmlExample = `<!DOCTYPE html>
 <html lang="en">
@@ -88,4 +266,9 @@ function showExample2() {
     null,
     2
   );
+}
+
+// Allows running the parser in Node for tests; ignored in the browser.
+if (typeof module !== "undefined") {
+  module.exports = { html2json, tokenize };
 }
