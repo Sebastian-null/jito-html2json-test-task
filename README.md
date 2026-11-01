@@ -48,11 +48,11 @@ The result is always a single `root` node, because an HTML fragment can have sev
 
 ### General
 - **The input is returned as written.** `<html>`, `<head>` and `<body>` are not inserted automatically, unlike in a browser.
-- **Non-string input** (`null`, `undefined`, numbers, ...) returns an empty root instead of throwing.
+- **Non-string input** (`null`, `undefined`, numbers, ...) returns an empty root with a warning (`Expected a string, got number`) instead of throwing.
 - As the HTML spec requires, the input is preprocessed first: a leading BOM is removed, and `\r\n` and `\r` are replaced with `\n`.
 
 ### Tags
-- Tag and attribute names are **lowercased**, because HTML is case-insensitive. **Exception:** inside `<svg>` and `<math>` the case is kept, since these languages are case-sensitive (`viewBox`).
+- Tag and attribute names are **lowercased**, because HTML is case-insensitive. **Exception:** inside `<svg>` and `<math>` the case is kept, since these languages are case-sensitive (`viewBox`). Inside `<foreignObject>` the content is HTML again, as in browsers. End tags are matched case-insensitively everywhere.
 - **Void elements** (`area, base, br, col, embed, hr, img, input, link, meta, source, track, wbr`) never have children and need no end tag.
 - **`<tag/>` is treated as closed for any tag**, including `<div/>`. A browser ignores the slash on non-void HTML elements; we follow the author's obvious intent instead (a habit from XML/JSX).
 
@@ -60,12 +60,15 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - An attribute without a value (`disabled`) gets an empty string `""`, which is what browsers do.
 - On **duplicate attributes the first one wins**, which is what browsers do.
 - **An unclosed quote** (`<div class="a>text</div>`) makes the value run to the next matching quote, or to the end of the input, as in browsers. Guessing where the value "should" end would break valid values like `title="a > b"`. A warning points to the quote.
-- Attributes are stored in an object created with `Object.create(null)`. With a plain `{}`, an attribute named `__proto__` would silently disappear, and `constructor` would look like an existing duplicate because of the inherited prototype.
+- Attributes are stored in an object created with `Object.create(null)`. With a plain `{}`, an attribute named `__proto__` would silently disappear, and `constructor` would look like an existing duplicate because of the inherited prototype. As a consequence, `attributes` has no `hasOwnProperty` method: use `"class" in node.attributes` or `Object.hasOwn(node.attributes, "class")`.
 
 ### Text
 - Text content is **not trimmed**: leading and trailing spaces can be meaningful (`Hello <b>world</b>`).
+  - This also applies when an end tag is left out: in `<ul>\n  <li>one\n  <li>two\n</ul>` the first item's text is `"one\n  "`, including the line break and indentation before the next `<li>`. This is not a bug: browsers keep exactly the same text in the DOM (`li.textContent`).
 - **Whitespace-only text that contains a line break is dropped**, because that is indentation from formatting the source. A whitespace-only text without a line break (`<b>a</b> <i>b</i>`) is kept, because it is a real space between words. Inside `<pre>` and `<textarea>` all whitespace is kept.
 - "Whitespace" means the HTML set `[ \t\n\r\f]`, not JS `\s`. `\s` also matches `&nbsp;` (U+00A0), and that is content.
+- The check runs on the source text **before** entities are decoded, so `<div>&#10;</div>`, a line break written on purpose, is kept.
+- A line break right after `<pre>` and `<textarea>` is dropped, as in browsers: it only formats the source.
 - Adjacent text nodes are merged into one.
 
 ### Character references (entities)
@@ -95,18 +98,24 @@ The result is always a single `root` node, because an HTML fragment can have sev
 ### Invalid HTML
 - **Implicit closing** for the most common cases:
   - `<p>` is closed by another `<p>` or by a block-level start tag (`div`, `ul`, `table`, `h1`–`h6`, ...).
-  - `<li>`, `<option>`, `<tr>`, `<td>`/`<th>` are closed by a sibling of the same kind, but **only if the open element is the current node** (top of the stack). Because of this, a nested `<ul>` never closes the `<li>` of an outer list.
+  - `<li>`, `<dt>`/`<dd>`, `<option>`/`<optgroup>`, `<tr>`, `<td>`/`<th>` are closed by a sibling of the same kind (`<tr>` also closes an open cell).
+  - Both rules apply **only if the element to close is the current node** (top of the stack). Because of this, a nested `<ul>` never closes the `<li>` of an outer list.
+  - These elements have optional end tags in valid HTML, so closing them implicitly (also by a parent's end tag or the end of input) gives no warning.
 - **An end tag that is not open** (`</span>` without `<span>`) is ignored, with a warning.
 - **An end tag that is open but not current** closes all elements above it: in `<b><i>x</b></i>`, `</b>` closes both elements and `</i>` is ignored.
 - **Tags still open at the end of the input** are closed, with a warning.
+- **An end tag with attributes** (`</p class="x">`) is used, and the attributes are ignored with a warning.
 - **Input that ends inside a tag** (`<div class="a`) is not lost: the content read so far is kept, with a warning.
 
 ### Robustness
 - The tree is built iteratively with an explicit stack, without recursion, so deeply nested input cannot overflow the call stack.
+- **Nesting is limited to 512 levels**, like in Chrome's parser: deeper elements are added as siblings, with one warning. `JSON.stringify` is recursive and throws `RangeError` on trees deeper than about 2800 levels (Node 26), so without the limit the result of valid HTML could not be serialized. The limit also keeps searching the stack for an end tag cheap.
 - The input is scanned in a single pass, with no regular expressions that could backtrack catastrophically.
 
 ## Known limitations
 - Whitespace that contains a line break between inline elements (`<span>a</span>\n<span>b</span>`) is dropped, so the text reads `ab` while a browser shows `a b`. Telling inline from block elements depends on CSS, which cannot be known from HTML alone.
+- A stray `</p>` is ignored; browsers insert an empty `<p></p>` for it. `</br>` is ignored; browsers treat it as `<br>`.
+- Implicit closing only looks at the current node, so `<p><b>text<div>` puts the `<div>` inside `<b>`, while a browser closes both `<b>` and `<p>`.
 - Only the most common implicit-closing rules are implemented, not the full HTML5 tree construction algorithm (no "adoption agency" for misnested formatting tags, no table foster parenting).
 - Only a subset of named character references is supported. An unknown `&name;` is kept as written, while a browser may decode a legacy prefix of it (`&notit;` → `¬it;`).
 - `<script>`, `<style>` and `<title>` inside `<svg>` are also read as raw text. In a browser they are regular SVG elements there. The tokenizer does not know the tree context.

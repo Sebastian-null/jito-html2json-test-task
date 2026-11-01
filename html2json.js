@@ -5,15 +5,64 @@ function convertHtml2JsonAndSet() {
   jsonArea.textContent = JSON.stringify(jsonObj, null, 2);
 }
 
-/* 
-  Update this function to convert html into json object.
-  You can rewrite it completely, just be sure it accepts htmlText as string and outputs json object.
+/*
+  Converts an HTML string into a JSON tree:
+    { type: "root", children: [...], warnings: [{ message, line, column }] }
+  Never throws: problems in the input are reported in `warnings`.
+  See README.md for the format and the design decisions.
 */
 function html2json(htmlText) {
-  return {
-    "Conversion results": "should be instead of this json obj",
-    "Just to show that it is dynamic value (input length)" : htmlText.length,
-  };
+  if (typeof htmlText !== "string") {
+    const received = htmlText === null ? "null" : typeof htmlText;
+    return {
+      type: "root",
+      children: [],
+      warnings: [{ message: `Expected a string, got ${received}`, line: 1, column: 1 }],
+    };
+  }
+
+  const input = normalizeInput(htmlText);
+  const warnings = [];
+  const builder = new TreeBuilder(warnings);
+  for (const token of tokenize(input, warnings)) builder.add(token);
+
+  const root = builder.finish();
+  root.warnings = locateWarnings(input, warnings);
+  return root;
+}
+
+/*
+  Turns { message, offset } into { message, line, column }, sorted by position.
+  Line starts are collected once, then each offset is found by binary search.
+*/
+function locateWarnings(input, warnings) {
+  if (warnings.length === 0) return [];
+
+  const lineStarts = [0];
+  for (let i = input.indexOf("\n"); i !== -1; i = input.indexOf("\n", i + 1)) lineStarts.push(i + 1);
+
+  return warnings
+    .slice()
+    .sort((a, b) => a.offset - b.offset)
+    .map(({ message, offset }) => {
+      const lineIndex = findLineIndex(lineStarts, offset);
+      return { message, line: lineIndex + 1, column: offset - lineStarts[lineIndex] + 1 };
+    });
+}
+
+// Index of the last line start that is <= offset.
+function findLineIndex(lineStarts, offset) {
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (lineStarts[middle] <= offset) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low;
 }
 
 /* ---------- Tokenizer ---------- */
@@ -44,6 +93,16 @@ function trimAsciiWhitespace(text) {
   return text.slice(start, end);
 }
 
+// True for text of only ASCII whitespace with a line break: indentation between tags.
+function isFormattingWhitespace(text) {
+  let hasLineBreak = false;
+  for (let i = 0; i < text.length; i++) {
+    if (!isAsciiWhitespace(text[i])) return false;
+    if (text[i] === "\n") hasLineBreak = true;
+  }
+  return hasLineBreak;
+}
+
 // Input preprocessing from the HTML spec: drop a leading BOM,
 // turn "\r\n" and a lone "\r" into "\n".
 function normalizeInput(input) {
@@ -55,7 +114,7 @@ function normalizeInput(input) {
   Splits the input into a flat list of tokens in a single forward pass:
     { type: "startTag", name, attributes, selfClosing, terminated, start, end }
     { type: "endTag",   name, attributes, selfClosing, terminated, start, end }
-    { type: "text",     content, start, end }
+    { type: "text",     content, formattingWhitespace, start, end }
     { type: "comment",  content, start, end }
     { type: "doctype",  content, start, end }
   Character references in text and attribute values are decoded, except in
@@ -70,8 +129,14 @@ function tokenize(input, warnings = []) {
   function pushText(end, decode) {
     if (end <= textStart) return;
     const raw = input.slice(textStart, end);
-    const content = decode ? decodeCharacterReferences(raw, false, textStart, warnings) : raw;
-    tokens.push({ type: "text", content, start: textStart, end });
+    tokens.push({
+      type: "text",
+      content: decode ? decodeCharacterReferences(raw, false, textStart, warnings) : raw,
+      // Checked before decoding, so "&#10;" written on purpose is not taken for indentation.
+      formattingWhitespace: isFormattingWhitespace(raw),
+      start: textStart,
+      end,
+    });
   }
 
   while (pos < input.length) {
@@ -457,6 +522,228 @@ function readNamedReference(text, amp, inAttribute) {
     return { value: NAMED_REFERENCES.get(prefix), end };
   }
   return null;
+}
+
+/* ---------- Tree builder ---------- */
+
+const VOID_ELEMENTS = new Set([
+  "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+]);
+
+// A start tag of these closes a <p> that is the current element: <p>text<div>.
+const CLOSES_P = new Set([
+  "address", "article", "aside", "blockquote", "dd", "details", "dialog", "div", "dl", "dt",
+  "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+  "header", "hgroup", "hr", "li", "main", "menu", "nav", "ol", "p", "pre", "section", "table", "ul",
+]);
+
+// A start tag closes these while one of them is the current element: <li>a<li>b.
+const IMPLICITLY_CLOSES = new Map([
+  ["li", new Set(["li"])],
+  ["dt", new Set(["dt", "dd"])],
+  ["dd", new Set(["dt", "dd"])],
+  ["option", new Set(["option"])],
+  ["optgroup", new Set(["option", "optgroup"])],
+  ["tr", new Set(["td", "th", "tr"])],
+  ["td", new Set(["td", "th"])],
+  ["th", new Set(["td", "th"])],
+]);
+
+// Their end tag may be left out in valid HTML, so closing them implicitly is not a warning.
+const OPTIONAL_END_TAGS = new Set([
+  "html", "head", "body", "p", "li", "dt", "dd", "option", "optgroup",
+  "thead", "tbody", "tfoot", "tr", "td", "th", "colgroup", "caption", "rt", "rp",
+]);
+
+const PRESERVE_WHITESPACE = new Set(["pre", "textarea"]);
+
+// JSON.stringify is recursive and throws on very deep trees (about 2800 levels in Node).
+// Chrome's parser does not nest deeper than 512 either; deeper elements become siblings.
+const MAX_DEPTH = 512;
+
+/*
+  Builds the tree from tokens with a stack of open elements, without recursion.
+  The top of the stack is the current element: new nodes go into its children.
+  Each stack entry keeps the node and what is needed while it is open:
+  `name` (lowercased, for matching end tags), `namespace` ("html", "svg" or "math"),
+  `preserveWhitespace`, and `cutOff` and `start` (for warnings).
+*/
+class TreeBuilder {
+  constructor(warnings) {
+    this.warnings = warnings;
+    this.root = { type: "root", children: [] };
+    this.stack = [{ node: this.root, name: "", namespace: "html", preserveWhitespace: false, start: 0 }];
+    // Elements past MAX_DEPTH that are not on the stack, by name, so their end tags are not "unexpected".
+    this.flattenedOpen = new Map();
+    this.depthWarned = false;
+    // Browsers drop a line break right after <pre> and <textarea>.
+    this.dropLeadingNewlineIn = null;
+  }
+
+  get current() {
+    return this.stack[this.stack.length - 1];
+  }
+
+  add(token) {
+    const dropLeadingNewlineIn = this.dropLeadingNewlineIn;
+    this.dropLeadingNewlineIn = null;
+
+    switch (token.type) {
+      case "startTag":
+        this.startTag(token);
+        break;
+      case "endTag":
+        this.endTag(token);
+        break;
+      case "text":
+        this.text(token, dropLeadingNewlineIn === this.current.node);
+        break;
+      case "comment":
+      case "doctype":
+        this.append({ type: token.type, content: token.content });
+        break;
+    }
+  }
+
+  finish() {
+    while (this.stack.length > 1) {
+      // A tag cut off by the end of input already has its own warning from the tokenizer.
+      this.pop(this.current.cutOff ? undefined : "is not closed before the end of input");
+    }
+    return this.root;
+  }
+
+  startTag(token) {
+    const name = token.name.toLowerCase();
+    if (contextNamespace(this.current) === "html") this.closeImplicitly(name);
+
+    const parent = this.current;
+    const namespace = elementNamespace(parent, name);
+    const isHtml = namespace === "html";
+    const element = {
+      type: "element",
+      // SVG and MathML are case-sensitive (viewBox), so their names are kept as written.
+      tag: isHtml ? name : token.name,
+      attributes: this.collectAttributes(token, isHtml),
+      children: [],
+    };
+    this.append(element);
+
+    if (token.selfClosing || (isHtml && VOID_ELEMENTS.has(name))) return;
+    if (this.stack.length > MAX_DEPTH) {
+      this.flatten(name, token);
+      return;
+    }
+
+    this.stack.push({
+      node: element,
+      name,
+      namespace,
+      preserveWhitespace: parent.preserveWhitespace || PRESERVE_WHITESPACE.has(name),
+      cutOff: !token.terminated,
+      start: token.start,
+    });
+    if (PRESERVE_WHITESPACE.has(name)) this.dropLeadingNewlineIn = element;
+  }
+
+  endTag(token) {
+    const name = token.name.toLowerCase();
+    if (token.attributes.length > 0) {
+      this.warn(`End tag </${token.name}> has attributes, they are ignored`, token.start);
+    }
+
+    const flattened = this.flattenedOpen.get(name);
+    if (flattened) {
+      this.flattenedOpen.set(name, flattened - 1);
+      return;
+    }
+
+    let index = this.stack.length - 1;
+    while (index > 0 && this.stack[index].name !== name) index--;
+    if (index === 0) {
+      this.warn(`Unexpected end tag </${token.name}> is ignored`, token.start);
+      return;
+    }
+
+    while (this.stack.length - 1 > index) this.pop(`is closed by </${token.name}> before its own end tag`);
+    this.stack.pop();
+  }
+
+  text(token, dropLeadingNewline) {
+    if (token.formattingWhitespace && !this.current.preserveWhitespace) return;
+
+    let content = token.content;
+    if (dropLeadingNewline && content[0] === "\n") content = content.slice(1);
+    if (content === "") return;
+
+    const children = this.current.node.children;
+    const last = children[children.length - 1];
+    if (last !== undefined && last.type === "text") {
+      last.content += content;
+    } else {
+      children.push({ type: "text", content });
+    }
+  }
+
+  // <p>a<div>, <li>a<li>b, <td>1<td>2: closes elements whose end tag the author left out.
+  closeImplicitly(name) {
+    if (CLOSES_P.has(name) && this.current.name === "p") this.pop();
+    const closes = IMPLICITLY_CLOSES.get(name);
+    while (closes !== undefined && closes.has(this.current.name)) this.pop();
+  }
+
+  // First attribute wins on duplicates. A prototype-less object keeps names like
+  // "__proto__" and "constructor" as plain keys.
+  collectAttributes(token, isHtml) {
+    const attributes = Object.create(null);
+    for (const { name, value } of token.attributes) {
+      const key = isHtml ? name.toLowerCase() : name;
+      if (key in attributes) {
+        this.warn(`Duplicate attribute "${key}" on <${token.name}> is ignored`, token.start);
+      } else {
+        attributes[key] = value;
+      }
+    }
+    return attributes;
+  }
+
+  flatten(name, token) {
+    this.flattenedOpen.set(name, (this.flattenedOpen.get(name) || 0) + 1);
+    if (!this.depthWarned) {
+      this.depthWarned = true;
+      this.warn(`Nesting deeper than ${MAX_DEPTH} levels is flattened: deeper elements are added as siblings`, token.start);
+    }
+  }
+
+  append(node) {
+    this.current.node.children.push(node);
+  }
+
+  // Closes the current element. `reason` becomes a warning, unless the element's
+  // end tag is optional (<p>, <li>, ...).
+  pop(reason) {
+    const frame = this.stack.pop();
+    if (reason !== undefined && !OPTIONAL_END_TAGS.has(frame.name)) {
+      this.warn(`Element <${frame.node.tag}> ${reason}`, frame.start);
+    }
+  }
+
+  warn(message, offset) {
+    this.warnings.push({ message, offset });
+  }
+}
+
+// Namespace that children of `frame` start in. Inside <foreignObject> SVG hosts HTML again.
+function contextNamespace(frame) {
+  return frame.namespace === "svg" && frame.name === "foreignobject" ? "html" : frame.namespace;
+}
+
+function elementNamespace(parent, name) {
+  const namespace = contextNamespace(parent);
+  if (namespace !== "html") return namespace;
+  if (name === "svg") return "svg";
+  if (name === "math") return "math";
+  return "html";
 }
 
 function showExample1() {
