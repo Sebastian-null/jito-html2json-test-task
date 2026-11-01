@@ -59,6 +59,7 @@ The result is always a single `root` node, because an HTML fragment can have sev
 ### Attributes
 - An attribute without a value (`disabled`) gets an empty string `""`, which is what browsers do.
 - On **duplicate attributes the first one wins**, which is what browsers do.
+- **An unclosed quote** (`<div class="a>text</div>`) makes the value run to the next matching quote, or to the end of the input, as in browsers. Guessing where the value "should" end would break valid values like `title="a > b"`. A warning points to the quote.
 - Attributes are stored in an object created with `Object.create(null)`. With a plain `{}`, an attribute named `__proto__` would silently disappear, and `constructor` would look like an existing duplicate because of the inherited prototype.
 
 ### Text
@@ -79,9 +80,10 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - `<script />` is treated as closed (see `<tag/>` above), so no raw text follows it.
 
 ### Comments and other markup
-- `<!-- ... -->` becomes a `comment` node. An unclosed comment runs to the end of the input.
-- `<!DOCTYPE ...>` becomes a `doctype` node (case-insensitive).
-- `<![CDATA[...]]>` and `<?...?>` are treated as comments, as browsers do in HTML.
+- `<!-- ... -->` becomes a `comment` node. As in browsers, `--!>` also closes a comment, and `<!-->` / `<!--->` are empty comments. An unclosed comment runs to the end of the input, with a warning.
+- `<!DOCTYPE ...>` becomes a `doctype` node (case-insensitive). `content` is the text after the keyword, e.g. `"html"`. Public and system identifiers are kept in it as written.
+- Markup browsers do not understand (`<![CDATA[...]]>`, `<?xml ...?>`, `<!foo>`, `</ 3>`) becomes a comment up to the first `>`, as in browsers, with a warning.
+- `</>` is ignored, as in browsers, with a warning. `</` at the end of the input is text.
 - A `<` that does not start a tag (`a < b`, `<3`) is plain text.
 
 ### Invalid HTML

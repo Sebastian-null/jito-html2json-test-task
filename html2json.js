@@ -34,12 +34,19 @@ function skipWhitespace(input, pos) {
   return pos;
 }
 
-// "<" starts a tag only before a letter ("<div") or "/" + letter ("</div").
-// Anything else ("a < b", "<3") is plain text.
-function isTagStart(input, pos) {
-  const next = input[pos + 1];
-  if (isAsciiLetter(next)) return true;
-  return next === "/" && isAsciiLetter(input[pos + 2]);
+function trimAsciiWhitespace(text) {
+  let start = 0;
+  let end = text.length;
+  while (start < end && isAsciiWhitespace(text[start])) start++;
+  while (end > start && isAsciiWhitespace(text[end - 1])) end--;
+  return text.slice(start, end);
+}
+
+// Input preprocessing from the HTML spec: drop a leading BOM,
+// turn "\r\n" and a lone "\r" into "\n".
+function normalizeInput(input) {
+  const withoutBom = input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
+  return withoutBom.replace(/\r\n?/g, "\n");
 }
 
 /*
@@ -47,9 +54,12 @@ function isTagStart(input, pos) {
     { type: "startTag", name, attributes, selfClosing, terminated, start, end }
     { type: "endTag",   name, attributes, selfClosing, terminated, start, end }
     { type: "text",     content, start, end }
-  `start` and `end` are offsets in the input, used later for warnings.
+    { type: "comment",  content, start, end }
+    { type: "doctype",  content, start, end }
+  `start` and `end` are offsets in the input. Problems found in the input are
+  added to `warnings` as { message, offset }.
 */
-function tokenize(input) {
+function tokenize(input, warnings = []) {
   const tokens = [];
   let pos = 0;
   let textStart = 0;
@@ -63,21 +73,24 @@ function tokenize(input) {
   while (pos < input.length) {
     const lt = input.indexOf("<", pos);
     if (lt === -1) break;
-    if (!isTagStart(input, lt)) {
+
+    const token = readMarkup(input, lt, warnings);
+    if (token === null) {
       pos = lt + 1;
       continue;
     }
 
     pushText(lt);
-    const tag = readTag(input, lt);
-    tokens.push(tag);
-    pos = tag.end;
+    if (token.type !== "ignored") tokens.push(token);
+    pos = token.end;
 
-    const name = tag.name.toLowerCase();
-    if (tag.type === "startTag" && !tag.selfClosing && RAW_TEXT_TAGS.has(name)) {
-      textStart = pos;
-      pos = findRawTextEnd(input, pos, name);
-      pushText(pos);
+    if (token.type === "startTag" && !token.selfClosing) {
+      const name = token.name.toLowerCase();
+      if (RAW_TEXT_TAGS.has(name)) {
+        textStart = pos;
+        pos = findRawTextEnd(input, pos, name);
+        pushText(pos);
+      }
     }
     textStart = pos;
   }
@@ -86,9 +99,33 @@ function tokenize(input) {
   return tokens;
 }
 
+/*
+  Decides what starts at the "<" and reads it. Returns null if the "<" is plain
+  text ("a < b", "<3", "</" at the end of input). For "</>", which browsers drop,
+  returns a token of type "ignored" so the caller can skip it.
+*/
+function readMarkup(input, pos, warnings) {
+  const next = input[pos + 1];
+  if (isAsciiLetter(next)) return readTag(input, pos, warnings);
+  if (next === "!") return readMarkupDeclaration(input, pos, warnings);
+  if (next === "?") {
+    return readBogusComment(input, pos, pos + 1, `"<?" markup is treated as a comment`, warnings);
+  }
+  if (next !== "/") return null;
+
+  const afterSlash = input[pos + 2];
+  if (isAsciiLetter(afterSlash)) return readTag(input, pos, warnings);
+  if (afterSlash === ">") {
+    warnings.push({ message: `Empty end tag "</>" is ignored`, offset: pos });
+    return { type: "ignored", start: pos, end: pos + 3 };
+  }
+  if (afterSlash === undefined) return null;
+  return readBogusComment(input, pos, pos + 2, "Invalid end tag is treated as a comment", warnings);
+}
+
 // Reads "<name ...>" or "</name ...>" starting at the "<".
 // If the input ends inside the tag, the tag is kept with terminated: false.
-function readTag(input, start) {
+function readTag(input, start, warnings) {
   const isEndTag = input[start + 1] === "/";
   let pos = start + (isEndTag ? 2 : 1);
 
@@ -118,8 +155,13 @@ function readTag(input, start) {
       }
       // A "/" not followed by ">" is ignored, as in browsers.
     } else {
-      pos = readAttribute(input, pos, attributes);
+      pos = readAttribute(input, pos, attributes, warnings);
     }
+  }
+
+  if (!terminated) {
+    const tagText = (isEndTag ? "</" : "<") + name;
+    warnings.push({ message: `Tag ${tagText}> is cut off by the end of input`, offset: start });
   }
 
   return {
@@ -137,9 +179,74 @@ function isTagNameEnd(ch) {
   return isAsciiWhitespace(ch) || ch === "/" || ch === ">";
 }
 
+// Reads what starts with "<!": a comment, a doctype or a bogus comment.
+function readMarkupDeclaration(input, start, warnings) {
+  if (input.startsWith("--", start + 2)) return readComment(input, start, warnings);
+  if (input.slice(start + 2, start + 9).toLowerCase() === "doctype") {
+    return readDoctype(input, start, warnings);
+  }
+  return readBogusComment(input, start, start + 2, `"<!" markup is treated as a comment`, warnings);
+}
+
+/*
+  Reads "<!-- ... -->". As in browsers, "--!>" also closes a comment, and
+  "<!-->" and "<!--->" are empty comments. Only "--" is searched for, so the
+  scan moves forward once even when "--!>" never appears in the input.
+*/
+function readComment(input, start, warnings) {
+  const contentStart = start + 4;
+  if (input[contentStart] === ">") return comment("", start, contentStart + 1);
+  if (input.startsWith("->", contentStart)) return comment("", start, contentStart + 2);
+
+  let dashes = input.indexOf("--", contentStart);
+  while (dashes !== -1) {
+    if (input[dashes + 2] === ">") {
+      return comment(input.slice(contentStart, dashes), start, dashes + 3);
+    }
+    if (input.startsWith("!>", dashes + 2)) {
+      return comment(input.slice(contentStart, dashes), start, dashes + 4);
+    }
+    dashes = input.indexOf("--", dashes + 1);
+  }
+
+  warnings.push({ message: "Comment is not closed before the end of input", offset: start });
+  return comment(input.slice(contentStart), start, input.length);
+}
+
+// Reads "<!DOCTYPE ...>". `content` is the text after the keyword ("html").
+function readDoctype(input, start, warnings) {
+  const contentStart = start + "<!doctype".length;
+  const close = input.indexOf(">", contentStart);
+  if (close === -1) {
+    warnings.push({ message: "Doctype is not closed before the end of input", offset: start });
+  }
+  const contentEnd = close === -1 ? input.length : close;
+  return {
+    type: "doctype",
+    content: trimAsciiWhitespace(input.slice(contentStart, contentEnd)),
+    start,
+    end: close === -1 ? contentEnd : close + 1,
+  };
+}
+
+/*
+  Markup browsers do not understand ("<?xml ?>", "<![CDATA[ ]]>", "</ 3>")
+  becomes a comment up to the first ">", as in browsers.
+*/
+function readBogusComment(input, start, contentStart, message, warnings) {
+  warnings.push({ message, offset: start });
+  const close = input.indexOf(">", contentStart);
+  const contentEnd = close === -1 ? input.length : close;
+  return comment(input.slice(contentStart, contentEnd), start, close === -1 ? contentEnd : close + 1);
+}
+
+function comment(content, start, end) {
+  return { type: "comment", content, start, end };
+}
+
 // Reads one attribute (name, optional "=" and value), adds it to `attributes`
 // and returns the position right after it.
-function readAttribute(input, pos, attributes) {
+function readAttribute(input, pos, attributes, warnings) {
   const nameStart = pos;
   // The first character always belongs to the name, even "=" (<div =a>).
   pos++;
@@ -157,7 +264,11 @@ function readAttribute(input, pos, attributes) {
   let value;
 
   if (quote === '"' || quote === "'") {
+    // Like in browsers, the value runs to the next matching quote, wherever it is.
     const close = input.indexOf(quote, pos + 1);
+    if (close === -1) {
+      warnings.push({ message: `Unclosed quote in attribute "${name}"`, offset: pos });
+    }
     const valueEnd = close === -1 ? input.length : close;
     value = input.slice(pos + 1, valueEnd);
     pos = close === -1 ? valueEnd : close + 1;
