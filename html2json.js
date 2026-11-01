@@ -468,7 +468,8 @@ function readNumericReference(text, amp, offset, warnings) {
   const digitsStart = pos;
   let codePoint = 0;
   while (pos < text.length && (isHex ? isAsciiHexDigit(text[pos]) : isAsciiDigit(text[pos]))) {
-    // Capped, so a very long number cannot grow past the valid range.
+    // Capped just above the valid range. Not required for correctness (a huge number
+    // becomes Infinity, which is also > MAX_CODE_POINT), but keeps it a small integer.
     codePoint = Math.min(codePoint * (isHex ? 16 : 10) + parseInt(text[pos], 16), MAX_CODE_POINT + 1);
     pos++;
   }

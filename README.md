@@ -78,7 +78,7 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - **Numeric references** (`&#169;`, `&#xA9;`, with or without `;`) are decoded as in browsers:
   - `&#0;`, values above U+10FFFF and surrogates (`&#xD800;`) become U+FFFD `�`, with a warning. (`String.fromCodePoint` would throw on these values.)
   - `&#128;`–`&#159;` are read as Windows-1252 (`&#128;` → `€`), because old pages used them that way.
-  - The number is capped while reading, so `&#99999999999999...;` cannot overflow.
+  - `&#99999999999999...;` of any length is safe: every value above U+10FFFF (in JS a huge number becomes `Infinity`, it does not wrap around) is replaced before `String.fromCodePoint` is called.
 - **Kept as written:** unknown names (`&foo;`), a lone `&`, `&#;`, `&#x;`.
 - The tables are `Map`s, not objects, so `&constructor;` does not find `Object.prototype.constructor`.
 
@@ -120,8 +120,25 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - Only a subset of named character references is supported. An unknown `&name;` is kept as written, while a browser may decode a legacy prefix of it (`&notit;` → `¬it;`).
 - `<script>`, `<style>` and `<title>` inside `<svg>` are also read as raw text. In a browser they are regular SVG elements there. The tokenizer does not know the tree context.
 
+## Running tests
+Requires Node.js 18 or newer, no dependencies to install. From the project root:
+
+```
+node --test
+```
+
+`tests/html2json.test.js` uses the test runner built into Node (`node:test`). It contains:
+- tests with the expected tree and warnings for every design decision above;
+- every file in `html_samples/`: no exception, the result serializes, and the tree is valid;
+- tree invariants checked on every result: each element has `tag`, `attributes` and `children`, no empty or adjacent text nodes, depth within the limit, every warning has a line and column;
+- 5000 random HTML-like inputs from a fixed seed, so a failure can be reproduced;
+- pathological inputs (a million `&`, 100000 stray end tags on a deep stack, ...) that would take quadratic time if the parser rescanned the input.
+
+`html2json.js` is a browser script, but it only touches `document` inside functions called by `index.html`, and it exports `html2json` for Node at the end of the file.
+
 ## Repository structure
 - `html2json.js`: the implementation.
 - `index.html`: the provided page (unchanged).
 - `html_samples/`: HTML files used to test the function.
+- `tests/`: automated tests (`node --test`).
 - `ai_help/`: the AI conversation used while working on the task.
