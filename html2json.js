@@ -128,7 +128,7 @@ function normalizeInput(input) {
   <script> and <style>. `start` and `end` are offsets in the input. Problems
   found in the input are added to `warnings` as { message, offset }.
 */
-function tokenize(input, warnings = []) {
+function tokenize(input, warnings) {
   const tokens = [];
   let pos = 0;
   let textStart = 0;
@@ -580,7 +580,7 @@ class TreeBuilder {
   constructor(warnings) {
     this.warnings = warnings;
     this.root = { type: "root", children: [] };
-    this.stack = [{ node: this.root, name: "", namespace: "html", preserveWhitespace: false, start: 0 }];
+    this.stack = [{ node: this.root, name: "", namespace: "html", preserveWhitespace: false, cutOff: false, start: 0 }];
     // Elements past MAX_DEPTH that are not on the stack, by name, so their end tags are not "unexpected".
     this.flattenedOpen = new Map();
     this.depthWarned = false;
@@ -719,7 +719,8 @@ class TreeBuilder {
     this.flattenedOpen.set(name, (this.flattenedOpen.get(name) || 0) + 1);
     if (!this.depthWarned) {
       this.depthWarned = true;
-      this.warn(`Nesting deeper than ${MAX_DEPTH} levels is flattened: deeper elements are added as siblings`, token.start);
+      const message = `Nesting deeper than ${MAX_DEPTH} levels is flattened: deeper elements are added as siblings`;
+      this.warn(message, token.start);
     }
   }
 
@@ -830,5 +831,5 @@ function showExample2() {
 
 // Allows running the parser in Node for tests; ignored in the browser.
 if (typeof module !== "undefined") {
-  module.exports = { html2json, tokenize };
+  module.exports = { html2json };
 }
