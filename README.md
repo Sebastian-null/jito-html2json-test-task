@@ -69,9 +69,15 @@ The result is always a single `root` node, because an HTML fragment can have sev
 - Adjacent text nodes are merged into one.
 
 ### Character references (entities)
-- Numeric (`&#169;`, `&#xA9;`) and the most common named references (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&nbsp;`, `&copy;`, ...) are decoded in text and attribute values.
-- Unknown references (`&foo;`) and a lone `&` are kept as written.
-- The full HTML list has over 2000 named references, so only a subset is supported. Adding more only requires extending the table.
+- Decoded in text and attribute values, also inside `<textarea>` and `<title>`. **Not** decoded in `<script>`, `<style>`, comments, doctype and attribute names.
+- **Named references:** about 60 of the most common ones (`&amp;`, `&lt;`, `&nbsp;`, `&copy;`, `&mdash;`, `&hellip;`, ...). The full HTML list has over 2000 names and could only be generated from the spec's `entities.json`. Any character can also be written as a number, and adding a name only requires one more line in the table. Names are case-sensitive (`&AMP;` is valid, `&Amp;` is not).
+- **Without `;`**: only the legacy names from HTML 3.2 (`&amp`, `&lt`, `&copy`, `&nbsp`, ...) are decoded, and the longest legacy prefix wins (`&copyright` → `©right`), as in browsers. **In attribute values** they are not decoded before `=` or a letter/digit, so URLs like `?a=1&copy=2` stay intact.
+- **Numeric references** (`&#169;`, `&#xA9;`, with or without `;`) are decoded as in browsers:
+  - `&#0;`, values above U+10FFFF and surrogates (`&#xD800;`) become U+FFFD `�`, with a warning. (`String.fromCodePoint` would throw on these values.)
+  - `&#128;`–`&#159;` are read as Windows-1252 (`&#128;` → `€`), because old pages used them that way.
+  - The number is capped while reading, so `&#99999999999999...;` cannot overflow.
+- **Kept as written:** unknown names (`&foo;`), a lone `&`, `&#;`, `&#x;`.
+- The tables are `Map`s, not objects, so `&constructor;` does not find `Object.prototype.constructor`.
 
 ### Raw text elements
 - The content of `<script>` and `<style>` is kept **exactly as written**, as one text node: no tags, no entity decoding.
@@ -102,7 +108,7 @@ The result is always a single `root` node, because an HTML fragment can have sev
 ## Known limitations
 - Whitespace that contains a line break between inline elements (`<span>a</span>\n<span>b</span>`) is dropped, so the text reads `ab` while a browser shows `a b`. Telling inline from block elements depends on CSS, which cannot be known from HTML alone.
 - Only the most common implicit-closing rules are implemented, not the full HTML5 tree construction algorithm (no "adoption agency" for misnested formatting tags, no table foster parenting).
-- Only a subset of named character references is supported.
+- Only a subset of named character references is supported. An unknown `&name;` is kept as written, while a browser may decode a legacy prefix of it (`&notit;` → `¬it;`).
 - `<script>`, `<style>` and `<title>` inside `<svg>` are also read as raw text. In a browser they are regular SVG elements there. The tokenizer does not know the tree context.
 
 ## Repository structure

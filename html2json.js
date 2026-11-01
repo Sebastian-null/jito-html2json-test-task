@@ -20,6 +20,8 @@ function html2json(htmlText) {
 
 // No tags inside: everything up to the matching end tag is text.
 const RAW_TEXT_TAGS = new Set(["script", "style", "textarea", "title"]);
+// Of those, character references are decoded only here, as in browsers.
+const DECODED_RAW_TEXT_TAGS = new Set(["textarea", "title"]);
 
 function isAsciiWhitespace(ch) {
   return ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f";
@@ -56,18 +58,20 @@ function normalizeInput(input) {
     { type: "text",     content, start, end }
     { type: "comment",  content, start, end }
     { type: "doctype",  content, start, end }
-  `start` and `end` are offsets in the input. Problems found in the input are
-  added to `warnings` as { message, offset }.
+  Character references in text and attribute values are decoded, except in
+  <script> and <style>. `start` and `end` are offsets in the input. Problems
+  found in the input are added to `warnings` as { message, offset }.
 */
 function tokenize(input, warnings = []) {
   const tokens = [];
   let pos = 0;
   let textStart = 0;
 
-  function pushText(end) {
-    if (end > textStart) {
-      tokens.push({ type: "text", content: input.slice(textStart, end), start: textStart, end });
-    }
+  function pushText(end, decode) {
+    if (end <= textStart) return;
+    const raw = input.slice(textStart, end);
+    const content = decode ? decodeCharacterReferences(raw, false, textStart, warnings) : raw;
+    tokens.push({ type: "text", content, start: textStart, end });
   }
 
   while (pos < input.length) {
@@ -80,7 +84,7 @@ function tokenize(input, warnings = []) {
       continue;
     }
 
-    pushText(lt);
+    pushText(lt, true);
     if (token.type !== "ignored") tokens.push(token);
     pos = token.end;
 
@@ -89,13 +93,13 @@ function tokenize(input, warnings = []) {
       if (RAW_TEXT_TAGS.has(name)) {
         textStart = pos;
         pos = findRawTextEnd(input, pos, name);
-        pushText(pos);
+        pushText(pos, DECODED_RAW_TEXT_TAGS.has(name));
       }
     }
     textStart = pos;
   }
 
-  pushText(input.length);
+  pushText(input.length, true);
   return tokens;
 }
 
@@ -270,13 +274,13 @@ function readAttribute(input, pos, attributes, warnings) {
       warnings.push({ message: `Unclosed quote in attribute "${name}"`, offset: pos });
     }
     const valueEnd = close === -1 ? input.length : close;
-    value = input.slice(pos + 1, valueEnd);
+    value = decodeCharacterReferences(input.slice(pos + 1, valueEnd), true, pos + 1, warnings);
     pos = close === -1 ? valueEnd : close + 1;
   } else {
     // Unquoted: ends at whitespace or ">". A "/" is part of the value (href=/a/).
     const valueStart = pos;
     while (pos < input.length && !isAsciiWhitespace(input[pos]) && input[pos] !== ">") pos++;
-    value = input.slice(valueStart, pos);
+    value = decodeCharacterReferences(input.slice(valueStart, pos), true, valueStart, warnings);
   }
 
   attributes.push({ name, value });
@@ -303,6 +307,156 @@ function findRawTextEnd(input, pos, tagName) {
     candidate = input.indexOf("</", candidate + 2);
   }
   return input.length;
+}
+
+/* ---------- Character references (entities) ---------- */
+
+// The most common named references. The full HTML list has over 2000 names,
+// any character can also be written as a number (&#8734;).
+// A Map, not an object: with {} "&constructor;" would find Object.prototype.constructor.
+const NAMED_REFERENCES = new Map([
+  ["amp", "&"], ["lt", "<"], ["gt", ">"], ["quot", '"'], ["apos", "'"],
+  ["AMP", "&"], ["LT", "<"], ["GT", ">"], ["QUOT", '"'],
+  ["nbsp", " "], ["ensp", " "], ["emsp", " "], ["thinsp", " "], ["shy", "­"],
+  ["copy", "©"], ["COPY", "©"], ["reg", "®"], ["REG", "®"], ["trade", "™"],
+  ["deg", "°"], ["plusmn", "±"], ["times", "×"], ["divide", "÷"], ["minus", "−"],
+  ["ne", "≠"], ["le", "≤"], ["ge", "≥"], ["infin", "∞"], ["micro", "µ"],
+  ["frac14", "¼"], ["frac12", "½"], ["frac34", "¾"], ["sup1", "¹"], ["sup2", "²"], ["sup3", "³"],
+  ["middot", "·"], ["bull", "•"], ["hellip", "…"], ["para", "¶"], ["sect", "§"],
+  ["ndash", "–"], ["mdash", "—"], ["iexcl", "¡"], ["iquest", "¿"],
+  ["laquo", "«"], ["raquo", "»"], ["lsquo", "‘"], ["rsquo", "’"], ["sbquo", "‚"],
+  ["ldquo", "“"], ["rdquo", "”"], ["bdquo", "„"],
+  ["cent", "¢"], ["pound", "£"], ["yen", "¥"], ["euro", "€"], ["curren", "¤"],
+  ["larr", "←"], ["rarr", "→"], ["uarr", "↑"], ["darr", "↓"], ["harr", "↔"], ["hearts", "♥"],
+]);
+
+// Old names (from HTML 3.2) that browsers also decode without the ";" ("&copy 2024").
+const LEGACY_NAMED_REFERENCES = new Set([
+  "amp", "lt", "gt", "quot", "AMP", "LT", "GT", "QUOT", "nbsp", "shy",
+  "copy", "COPY", "reg", "REG", "deg", "plusmn", "times", "divide", "micro",
+  "frac14", "frac12", "frac34", "sup1", "sup2", "sup3", "middot", "para", "sect",
+  "iexcl", "iquest", "laquo", "raquo", "cent", "pound", "yen", "curren",
+]);
+const LONGEST_LEGACY_NAME = Math.max(...[...LEGACY_NAMED_REFERENCES].map((name) => name.length));
+
+// Browsers read &#128;-&#159; as Windows-1252 bytes, because old pages used them that way.
+const WINDOWS_1252_REPLACEMENTS = new Map([
+  [0x80, 0x20ac], [0x82, 0x201a], [0x83, 0x0192], [0x84, 0x201e], [0x85, 0x2026],
+  [0x86, 0x2020], [0x87, 0x2021], [0x88, 0x02c6], [0x89, 0x2030], [0x8a, 0x0160],
+  [0x8b, 0x2039], [0x8c, 0x0152], [0x8e, 0x017d], [0x91, 0x2018], [0x92, 0x2019],
+  [0x93, 0x201c], [0x94, 0x201d], [0x95, 0x2022], [0x96, 0x2013], [0x97, 0x2014],
+  [0x98, 0x02dc], [0x99, 0x2122], [0x9a, 0x0161], [0x9b, 0x203a], [0x9c, 0x0153],
+  [0x9e, 0x017e], [0x9f, 0x0178],
+]);
+
+const MAX_CODE_POINT = 0x10ffff;
+
+function isAsciiDigit(ch) {
+  return ch >= "0" && ch <= "9";
+}
+
+function isAsciiHexDigit(ch) {
+  return isAsciiDigit(ch) || (ch >= "a" && ch <= "f") || (ch >= "A" && ch <= "F");
+}
+
+function isAsciiAlphanumeric(ch) {
+  return isAsciiLetter(ch) || isAsciiDigit(ch);
+}
+
+/*
+  Replaces character references in `text`: "&amp;", "&#169;", "&#xA9;".
+  Unknown or broken references are kept as written. `offset` is the position of
+  `text` in the input, used for warnings. In attribute values a legacy name
+  without ";" is not decoded before "=" or a letter/digit, so URLs like
+  "?a=1&copy=2" stay intact.
+*/
+function decodeCharacterReferences(text, inAttribute, offset, warnings) {
+  let amp = text.indexOf("&");
+  if (amp === -1) return text;
+
+  const parts = [];
+  let copied = 0;
+  while (amp !== -1) {
+    const reference = text[amp + 1] === "#"
+      ? readNumericReference(text, amp, offset, warnings)
+      : readNamedReference(text, amp, inAttribute);
+
+    if (reference === null) {
+      amp = text.indexOf("&", amp + 1);
+    } else {
+      parts.push(text.slice(copied, amp), reference.value);
+      copied = reference.end;
+      amp = text.indexOf("&", copied);
+    }
+  }
+  parts.push(text.slice(copied));
+  return parts.join("");
+}
+
+// Reads "&#169;" or "&#xA9;" (the ";" is optional, as in browsers).
+// Returns { value, end } or null if there are no digits ("&#;").
+function readNumericReference(text, amp, offset, warnings) {
+  let pos = amp + 2;
+  const isHex = text[pos] === "x" || text[pos] === "X";
+  if (isHex) pos++;
+
+  const digitsStart = pos;
+  let codePoint = 0;
+  while (pos < text.length && (isHex ? isAsciiHexDigit(text[pos]) : isAsciiDigit(text[pos]))) {
+    // Capped, so a very long number cannot grow past the valid range.
+    codePoint = Math.min(codePoint * (isHex ? 16 : 10) + parseInt(text[pos], 16), MAX_CODE_POINT + 1);
+    pos++;
+  }
+  if (pos === digitsStart) return null;
+  if (text[pos] === ";") pos++;
+
+  return { value: codePointToString(codePoint, text.slice(amp, pos), offset + amp, warnings), end: pos };
+}
+
+/*
+  Turns a number from a reference into a string, as browsers do: 0, values above
+  U+10FFFF and surrogates become U+FFFD, and 0x80-0x9F use Windows-1252.
+  String.fromCodePoint would throw on the out-of-range values.
+*/
+function codePointToString(codePoint, source, offset, warnings) {
+  const isSurrogate = codePoint >= 0xd800 && codePoint <= 0xdfff;
+  if (codePoint === 0 || codePoint > MAX_CODE_POINT || isSurrogate) {
+    const shown = source.length > 20 ? `${source.slice(0, 20)}...` : source;
+    warnings.push({ message: `Invalid character reference "${shown}" is replaced with U+FFFD`, offset });
+    return "�";
+  }
+  if (WINDOWS_1252_REPLACEMENTS.has(codePoint)) {
+    return String.fromCodePoint(WINDOWS_1252_REPLACEMENTS.get(codePoint));
+  }
+  return String.fromCodePoint(codePoint);
+}
+
+/*
+  Reads "&name;". Without ";" only legacy names are decoded, and the longest
+  legacy prefix wins, as in browsers ("&copyright" -> "©right").
+  Unknown "&name;" is not decoded: guessing a prefix there could be wrong.
+  Returns { value, end } or null.
+*/
+function readNamedReference(text, amp, inAttribute) {
+  let pos = amp + 1;
+  while (pos < text.length && isAsciiAlphanumeric(text[pos])) pos++;
+  const name = text.slice(amp + 1, pos);
+  if (name === "") return null;
+
+  if (text[pos] === ";") {
+    return NAMED_REFERENCES.has(name) ? { value: NAMED_REFERENCES.get(name), end: pos + 1 } : null;
+  }
+
+  for (let length = Math.min(name.length, LONGEST_LEGACY_NAME); length >= 2; length--) {
+    const prefix = name.slice(0, length);
+    if (!LEGACY_NAMED_REFERENCES.has(prefix)) continue;
+
+    const end = amp + 1 + length;
+    const next = text[end];
+    if (inAttribute && (next === "=" || isAsciiAlphanumeric(next))) return null;
+    return { value: NAMED_REFERENCES.get(prefix), end };
+  }
+  return null;
 }
 
 function showExample1() {
