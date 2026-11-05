@@ -144,3 +144,4 @@ node --test
 - `html_samples/`: HTML files used to test the function.
 - `tests/`: automated tests (`node --test`).
 - `ai_help/`: the AI conversation used while working on the task.
+- `.git/`: included in the archive on purpose, so the commit history shows how the solution was built stage by stage.
